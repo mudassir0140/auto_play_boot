@@ -2,6 +2,7 @@ import { prisma } from './prisma'
 import type { CurrentUser } from './session'
 import { parseJsonList } from './session'
 import { checkApplicationCooldown, recordApplicationAttempt } from './application-cooldown'
+import { verifyApplicationRecipient } from './recipient'
 import {
   generateApplicationEmail,
   sendApplicationEmail,
@@ -25,7 +26,9 @@ export type ApplyFailureCode =
   | 'already_applied'
   | 'cooldown'
   | 'no_recipient'
+  | 'unverified_recipient'
   | 'no_cv'
+  | 'no_portfolio'
   | 'gmail_not_connected'
   | 'gmail_api_disabled'
   | 'gmail_scope_missing'
@@ -54,14 +57,25 @@ export function httpStatusForApplyFailure(code: ApplyFailureCode): number {
 }
 
 /** Failures that will hit every other job too — the auto-apply loop stops on these. */
-export const BLOCKING_APPLY_FAILURES: ApplyFailureCode[] = ['gmail_not_connected', 'gmail_api_disabled', 'gmail_scope_missing', 'no_cv']
+export const BLOCKING_APPLY_FAILURES: ApplyFailureCode[] = ['gmail_not_connected', 'gmail_api_disabled', 'gmail_scope_missing', 'no_cv', 'no_portfolio']
+
+const isHttpUrl = (value: string | null | undefined): value is string => {
+  if (!value) return false
+  try {
+    const u = new URL(value)
+    return u.protocol === 'https:' || u.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
 
 /**
  * Apply to one of the user's tracked jobs.
- *  - method "email": send from THIS user's Gmail to the address found in the posting
- *    (or `recipientEmail` supplied by the user), with their stored CV attached.
- *    Recorded as applied ONLY after Gmail confirms the message was sent; any failure
- *    is saved on the job (status apply_failed + the reason) and in the history, never hidden.
+ *  - method "email": send from THIS user's Gmail to a VERIFIED company address (the one found in
+ *    the posting, or `recipientEmail` supplied by the user), with the user's CV file attached and
+ *    their portfolio linked in the body. Recorded as applied ONLY after Gmail confirms the message
+ *    was sent; any failure is saved on the job (status apply_failed + the reason) and in the history.
+ *    An address that cannot be verified as the company's sends nothing: the job is marked manual_review.
  *  - method "manual": the user applied on the employer's site/ATS themselves; Boot records
  *    that (there is no legitimate way for Boot to submit those forms for them).
  * Both paths enforce the 7-day cooldown and write Application + History rows.
@@ -82,18 +96,30 @@ export async function applyToJob(
     return { ok: false, code: 'no_recipient', message: 'This posting has no application email. Apply on the employer site, then mark it as applied.' }
   }
 
-  if (opts.method === 'email' && recipient && recipient.toLowerCase() === user.email.toLowerCase()) {
-    return { ok: false, code: 'no_recipient', message: 'Cannot send application to your own email address.' }
-  }
-
   if (opts.method === 'email') {
     const account = await getGoogleAccount(user.id)
     if (!isGmailConnected(account)) {
       return { ok: false, code: 'gmail_not_connected', message: 'Gmail is not connected. Sign in with Google again.' }
     }
+    // The CV must be a real stored file: a link alone is not attached to the email.
     const cv = await prisma.resumeFile.findFirst({ where: { userId: user.id }, select: { id: true } })
-    if (!cv && !user.cvUrl) {
-      return { ok: false, code: 'no_cv', message: 'Upload your CV on the Profile page before Boot emails applications for you.' }
+    if (!cv) {
+      return { ok: false, code: 'no_cv', message: 'Upload your CV file (PDF, DOCX or TXT) on the Profile page. Boot attaches it to every application email.' }
+    }
+    if (!isHttpUrl(user.portfolioUrl)) {
+      return { ok: false, code: 'no_portfolio', message: 'Add your portfolio URL (https://…) on the Profile page. Every application email links to it.' }
+    }
+    const verdict = verifyApplicationRecipient(recipient, {
+      userEmail: user.email,
+      companyName: job.company,
+      companyWebsite: opts.company?.website,
+    })
+    if (!verdict.ok) {
+      // Nothing is sent. The posting is kept for the user to review by hand.
+      await prisma.job
+        .update({ where: { id: job.id }, data: { status: 'manual_review', applyError: verdict.message, applyAttemptedAt: new Date() } })
+        .catch(() => {})
+      return { ok: false, code: 'unverified_recipient', message: `${verdict.message} Marked for manual review; nothing was sent.` }
     }
   }
 
@@ -129,27 +155,23 @@ export async function applyToJob(
   if (opts.method === 'email' && recipient) {
     try {
       const cv = await prisma.resumeFile.findFirst({ where: { userId: user.id }, orderBy: { createdAt: 'desc' } })
+      if (!cv || !isHttpUrl(user.portfolioUrl)) throw new Error('CV or portfolio link is missing. Check your Profile page and try again.')
+
       const content = generateApplicationEmail({
         jobTitle: job.title,
         company: job.company,
         userName: user.name || user.email,
         userEmail: user.email,
         skills: parseJsonList(user.skills),
-        cvUrl: user.cvUrl,
         portfolioUrl: user.portfolioUrl,
-        hasAttachment: !!cv,
         inquiry: opts.company?.inquiry,
       })
       content.to = recipient
-      if (cv) content.attachment = { fileName: cv.fileName, contentType: cv.contentType, data: Buffer.from(cv.data) }
+      content.attachment = { fileName: cv.fileName, contentType: cv.contentType, data: Buffer.from(cv.data) }
 
-      const sent = await sendApplicationEmail(user.id, content, user.name)
+      // The sender is checked inside sendApplicationEmail, BEFORE Gmail is called.
+      const sent = await sendApplicationEmail(user.id, content, user.name, user.email)
       senderEmail = sent.from
-
-      // Verify the sender is the authenticated user's email to prevent accidental sends from shared/admin accounts
-      if (sent.from.toLowerCase() !== user.email.toLowerCase()) {
-        throw new Error(`Email was sent from ${sent.from}, not your registered email ${user.email}. This should not happen — contact support.`)
-      }
 
       // The email IS sent at this point. If saving the record fails we must NOT roll the
       // application back (it would be re-sent later); log it and carry on.
@@ -167,7 +189,7 @@ export async function applyToJob(
             company: job.company,
             jobTitle: job.title,
             fromEmail: sent.from,
-            cvFileName: cv?.fileName ?? null,
+            cvFileName: cv.fileName,
             cvUrl: user.cvUrl,
             portfolioUrl: user.portfolioUrl,
             status: 'sent',

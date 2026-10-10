@@ -395,7 +395,7 @@ function wrap76(b64: string) {
   return b64.replace(/(.{76})/g, '$1\r\n')
 }
 
-function buildMime(from: string, email: EmailContent): string {
+export function buildMime(from: string, email: EmailContent): string {
   const boundary = `boot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
   const altBoundary = `${boundary}_alt`
   const headers = [
@@ -433,15 +433,22 @@ function buildMime(from: string, email: EmailContent): string {
  * Sends through the user's own Gmail; the message appears in their Sent folder.
  * Only reports success when Gmail returns a message id (and, if it reports labels,
  * the SENT label) — an application is never recorded as sent on a guess.
+ * `expectedFrom` is checked against the connected Gmail address BEFORE sending, so a
+ * wrong account never sends anything (checking after the send would leave a sent email
+ * with no record, and a retry would send it again).
  */
 export async function sendApplicationEmail(
   userId: string,
   email: EmailContent,
-  fromName?: string | null
+  fromName: string | null | undefined,
+  expectedFrom: string
 ): Promise<{ messageId: string; threadId: string | null; from: string }> {
   return withGmail(userId, async (gmail) => {
     const profile = await gmail.users.getProfile({ userId: 'me' })
     const address = profile.data.emailAddress || ''
+    if (address.toLowerCase() !== expectedFrom.trim().toLowerCase()) {
+      throw new Error(`The connected Gmail is ${address}, not your registered email ${expectedFrom}. Nothing was sent. Sign in with Google using ${expectedFrom}.`)
+    }
     const from = fromName ? `${encodeHeader(fromName)} <${address}>` : address
     const raw = Buffer.from(buildMime(from, email))
       .toString('base64')
@@ -461,45 +468,53 @@ export async function sendApplicationEmail(
 const escapeHtml = (s: string) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
+/**
+ * The application email. Plain, short and tailored: job title and company, the CV as a real
+ * attachment, and the user's portfolio as a clickable link. Callers must only send when the
+ * CV file and a valid portfolio URL exist (see applyToJob).
+ */
 export function generateApplicationEmail(opts: {
   jobTitle: string
   company: string
   userName: string
   userEmail: string
   skills: string[]
-  cvUrl: string | null
-  portfolioUrl: string | null
-  hasAttachment: boolean
+  portfolioUrl: string
   /** No specific opening: ask whether a junior frontend / internship position is available. */
   inquiry?: boolean
 }): EmailContent {
-  const { jobTitle, company, userName, userEmail, skills, cvUrl, portfolioUrl, hasAttachment, inquiry } = opts
-  const skillLine = skills.length ? `My core skills include ${skills.slice(0, 8).join(', ')}.` : ''
+  const { jobTitle, company, userName, userEmail, skills, portfolioUrl, inquiry } = opts
+  const topSkills = skills.slice(0, 5).join(', ')
+  const skillSentence = topSkills ? ` My core skills include ${topSkills}.` : ''
 
-  const lines = [
-    'Dear Hiring Team,',
-    '',
+  type Para = { text: string; html?: string }
+  const link = `<a href="${escapeHtml(portfolioUrl)}" style="color:#1a73e8">${escapeHtml(portfolioUrl)}</a>`
+  const paras: Para[] = [
+    { text: 'Dear Hiring Team,' },
+    { text: '' },
     inquiry
-      ? `I am a frontend developer and I am writing to ask whether ${company} has, or expects to have, an opening for a Junior Frontend / React / Next.js Developer or an internship. ${skillLine}`.trim()
-      : `I am writing to apply for the ${jobTitle} position at ${company}. ${skillLine}`.trim(),
-    '',
-    hasAttachment ? 'My CV is attached to this email.' : '',
-    cvUrl ? `CV: ${cvUrl}` : '',
-    portfolioUrl ? `Portfolio: ${portfolioUrl}` : '',
-    '',
-    inquiry
-      ? 'If there is a suitable opportunity now or in the future, I would be glad to share more about my work. Thank you for your time.'
-      : 'Thank you for your time and consideration. I would welcome the chance to discuss the role.',
-    '',
-    'Best regards,',
-    userName,
-    userEmail,
-  ].filter((l, i, arr) => !(l === '' && arr[i - 1] === ''))
+      ? { text: `I am a frontend developer and I am writing to ask whether ${company} has, or expects to have, an opening for a Junior Frontend / React / Next.js Developer or an internship.${skillSentence}` }
+      : { text: `I am writing to apply for the ${jobTitle} position at ${company}. I would welcome the opportunity to contribute to your team.${skillSentence}` },
+    { text: '' },
+    { text: `Please find my CV attached. My portfolio is available here: ${portfolioUrl}`, html: `Please find my CV attached. My portfolio is available here: ${link}` },
+    { text: '' },
+    {
+      text: inquiry
+        ? 'If there is a suitable opportunity now or in the future, I would be glad to share more about my work. Thank you for your time.'
+        : 'Thank you for your time and consideration.',
+    },
+    { text: '' },
+    { text: 'Kind regards,' },
+    { text: userName },
+    { text: userEmail },
+  ]
 
-  const bodyPlain = lines.join('\n')
-  const bodyHtml = `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#222">${lines
-    .map((l) => (l ? `<p style="margin:0 0 8px">${escapeHtml(l)}</p>` : '<br>'))
+  const bodyPlain = paras.map((p) => p.text).join('\n')
+  const bodyHtml = `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#222">${paras
+    .filter((p) => p.text)
+    .map((p) => `<p style="margin:0 0 12px">${p.html ?? escapeHtml(p.text)}</p>`)
     .join('')}</div>`
 
-  return { to: '', subject: inquiry ? `Frontend Developer / Internship Inquiry – ${userName}` : `Application for ${jobTitle} – ${userName}`, bodyPlain, bodyHtml }
+  const subject = inquiry ? `Frontend Developer / Internship Inquiry – ${userName}` : `Application for ${jobTitle}`
+  return { to: '', subject, bodyPlain, bodyHtml }
 }
