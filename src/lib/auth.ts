@@ -44,6 +44,13 @@ if (!clientSecret || clientSecret === 'your-google-client-secret-here') {
 }
 if (!nextAuthUrl) {
   console.error('[auth] NEXTAUTH_URL is not set — OAuth callbacks will fail')
+} else {
+  // Google rejects sign-in with "Error 400: redirect_uri_mismatch" unless this exact value is an
+  // Authorized redirect URI on the OAuth client. Built the same way next-auth v4 builds it
+  // (origin + path, default /api/auth, then /callback/google), so the log matches what is sent.
+  const authUrl = new URL(nextAuthUrl)
+  const authPath = authUrl.pathname === '/' ? '/api/auth' : authUrl.pathname.replace(/\/$/, '')
+  console.log(`[auth] Google redirect_uri sent to Google: ${authUrl.origin}${authPath}/callback/google`)
 }
 
 if (process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_APP_URL && process.env.NEXTAUTH_URL && process.env.NEXTAUTH_URL !== process.env.NEXT_PUBLIC_APP_URL) {
